@@ -448,6 +448,7 @@ function handleChanOpenInit(datagram: ChanOpenInit) {
     datagram.counterpartyPortIdentifier
   )
   version, err = module.onChanOpenInit(
+    channelCapability, // pass in channel capability so that module can claim it (if needed)
     datagram.order,
     datagram.connectionHops,
     datagram.portIdentifier,
@@ -498,6 +499,7 @@ function handleChanOpenTry(datagram: ChanOpenTry) {
     datagram.proofHeight
   )
   version, err = module.onChanOpenTry(
+    channelCapability, // pass in channel capability so that module can claim it (if needed)
     datagram.order,
     datagram.connectionHops,
     datagram.portIdentifier,

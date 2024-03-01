@@ -28,6 +28,10 @@ ICS-27 Interchain Accounts outlines a cross-chain account management protocol bu
 
 The IBC handler interface & IBC relayer module interface are as defined in [ICS-25](../../core/ics-025-handler-interface) and [ICS-26](../../core/ics-026-routing-module), respectively.
 
+`channelCapabilityPath` is as defined in [ICS 4](../../core/ics-004-channel-and-packet-semantics).
+
+`claimCapability` is as defined in [ICS 5](../../core/ics-005-port-allocation).
+
 ### Desired properties
 
 - Permissionless: An interchain account may be created by any actor without the approval of a third party (e.g. chain governance). Note: Individual implementations may implement their own permissioning scheme, however the protocol must not require permissioning from a trusted party to be secure.
@@ -384,6 +388,7 @@ An interchain account module will accept new channels from any module on another
 ```typescript
 // Called on Controller Chain by InitInterchainAccount
 function onChanOpenInit(
+  capability: CapabilityKey,
   order: ChannelOrder,
   connectionHops: [Identifier],
   portIdentifier: Identifier,
@@ -421,7 +426,7 @@ function onChanOpenInit(
     }
     version = marshalJSON(metadata)
   }
-
+  
   // only open the channel if:
   // - there is no active channel already set (with status OPEN)
   // OR
@@ -438,6 +443,9 @@ function onChanOpenInit(
     abortTransactionUnless(previousOrder === order)
     previousMetadata = UnmarshalJSON(activeChannel.version)
     abortTransactionUnless(previousMetadata === metadata)
+  } else {
+    // claim channel capability
+    claimCapability(channelCapabilityPath(portIdentifier, channelIdentifier), capability)
   }
 
   return version, nil
@@ -447,6 +455,7 @@ function onChanOpenInit(
 ```typescript
 // Called on Host Chain by Relayer
 function onChanOpenTry(
+  capability: CapabilityKey,
   order: ChannelOrder,
   connectionHops: [Identifier],
   portIdentifier: Identifier,
