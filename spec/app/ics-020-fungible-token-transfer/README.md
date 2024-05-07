@@ -35,7 +35,7 @@ The IBC handler interface & IBC routing module interface are as defined in [ICS 
 
 ### Data Structures
 
-Only one packet data type is required: `FungibleTokenPacketData`, which specifies the denomination, amount, sending account, and receiving account or `FungibleTokenPacketDataV2` which specifies multiple tokens being sent between sender and receiver. A v2 supporting chain can optionally convert a v1 packet for channels that are still on version 1.
+Only one packet data type is required: `FungibleTokenPacketData`, which specifies the denomination, amount, sending account, and receiving account or `FungibleTokenPacketDataV2` which specifies multiple tokens being sent between sender and receiver along with a forwarding path that can forward tokens further beyond the initial receiving chain. A v2 supporting chain can optionally convert a v1 packet for channels that are still on version 1.
 
 ```typescript
 interface FungibleTokenPacketData {
@@ -51,12 +51,23 @@ interface FungibleTokenPacketDataV2 {
   sender: string
   receiver: string
   memo: string
+  forwardingPath: ForwardingInfo // a list of forwarding info determining where the tokens must be forwarded next
+}
+
+interface ForwardingInfo {
+  hops: []Hop
+  memo: string,
+}
+
+interface Hop {
+  portID: string,
+  channelId: string,
 }
 
 interface Token {
   denom: string // base denomination
   trace: []string
-  amount: uint64
+  amount: uint256
 }
 ```
 
@@ -67,6 +78,42 @@ The ICS 20 token traces are represented by a list of the form `{ics20Port}/{ics2
 A sending chain may be acting as a source or sink zone. When a chain is sending tokens across a port and channel which are not equal to the last prefixed port and channel pair, it is acting as a source zone. When tokens are sent from a source zone, the destination port and channel will be prepended to the trace (once the tokens are received) adding another hop to a tokens record. When a chain is sending tokens across a port and channel which are equal to the last prefixed port and channel pair, it is acting as a sink zone. When tokens are sent from a sink zone, the first element of the trace, which was the last port and channel pair added to the trace is removed (once the tokens are received), undoing the last hop in the tokens record. A more complete explanation is [present in the ibc-go implementation](https://github.com/cosmos/ibc-go/blob/457095517b7832c42ecf13571fee1e550fec02d0/modules/apps/transfer/keeper/relay.go#L18-L49).
 
 The following sequence diagram exemplifies the multi-chain token transfer dynamics. This process encapsulates the intricate steps involved in transferring tokens in a cycle that begins and ends on the same chain, traversing through Chain A, Chain B, and Chain C. The order of operations is meticulously outlined as `A -> B -> C -> A -> C -> B -> A`.
+
+The forwarding path in the `v2` packet tells the receiving chain where to send the tokens to next. This must be constructed as a list of portID/channelID pairs with each element concatenated as `portID/channelID`. This allows users to automatically route tokens through the interchain. A common usecase might be to unwind the trace of the tokens back to the original source chain before sending it forward to the final intended destination.
+
+Here are examples of the transfer packet data:
+
+```typescript
+
+// V1 example of transfer packet data
+FungibleTokenPacketData {
+  denom: "transfer/channel-1/transfer/channel-4/uatom",
+  amount: 500,
+  sender: cosmosexampleaddr1,
+  receiver: cosmosexampleaddr2,
+  memo: "exampleMemo",
+}
+
+// V2 example of transfer packet data
+FungibleTokenPacketDataV2 {
+  tokens: [
+    Token{
+      denom: uatom,
+      amount: 500,
+      trace: ["transfer/channel-1", "transfer/channel-4"],
+    },
+    Token{
+      denom: btc,
+      amount: 7,
+      trace: ["transfer/channel-3"],
+    }
+  ],
+  sender: cosmosexampleaddr1,
+  receiver: cosmosexampleaddr2,
+  memo: "",
+  forwardingPath: {[{"transfer", "channel-7"}, {"transfer", "channel-13"}], , "swap: {...}"}, // provide hops in order and the memo intended for final hop
+}
+```
 
 ![Transfer Example](source-and-sink-zones.png)
 
@@ -92,6 +139,7 @@ The fungible token transfer bridge module tracks escrow addresses associated wit
 ```typescript
 interface ModuleState {
   channelEscrowAddresses: Map<Identifier, string>
+  channelForwardingAddresses: Map<Identifier, string>
 }
 ```
 
@@ -241,11 +289,14 @@ function sendFungibleTokens(
   sender: string,
   receiver: string,
   memo: string,
+  forwardingPath: ForwardingInfo,
   sourcePort: string,
   sourceChannel: string,
   timeoutHeight: Height,
   timeoutTimestamp: uint64, // in unix nanoseconds
 ): uint64 {
+  // memo and forwardingPath cannot both be non-empty
+  abortTransactionUnless(memo != "" && forwardingPath != nil)
   for token in tokens {
     prefix = "{sourcePort}/{sourceChannel}/"
     // we are the source if the denomination is not prefixed
@@ -269,11 +320,16 @@ function sendFungibleTokens(
   transferVersion = getAppVersion(channel.version)
   if transferVersion == "ics20-1" {
     abortTransactionUnless(len(tokens) == 1)
-    v1Denom = tokens[0].trace + tokens[0].denom)
-    data = FungibleTokenPacketData{v1Denom, tokens[0].amount, sender, receiver, memo}
+    token = tokens[0]
+    // abort if forwardingPath defined
+    abortTransactionUnless(forwardingPath == nil)
+    // create v1 denom of the form: port1/channel1/port2/channel2/port3/channel3/denom
+    v1Denom = constructOnChainDenom(token.trace, token.denom)
+    // v1 packet data does not support forwardingPath fields
+    data = FungibleTokenPacketData{v1Denom, token.amount, sender, receiver, memo}
   } else if transferVersion == "ics20-2" {
     // create FungibleTokenPacket data
-    data = FungibleTokenPacketDataV2{tokens, sender, receiver, memo}
+    data = FungibleTokenPacketDataV2{tokens, sender, receiver, memo, forwardingPath}
   } else {
     // should never be reached as transfer version must be negotiated to be either
     // ics20-1 or ics20-2 during channel handshake
@@ -287,7 +343,7 @@ function sendFungibleTokens(
     sourceChannel,
     timeoutHeight,
     timeoutTimestamp,
-    json.marshal(data) // json-marshalled bytes of packet data
+    MarshalJSON(data) // json-marshalled bytes of packet data
   )
 
   return sequence
@@ -302,6 +358,9 @@ function onRecvPacket(packet: Packet) {
   // getAppVersion returns the transfer version that is embedded in the channel version
   // as the channel version may contain additional app or middleware version(s)
   transferVersion = getAppVersion(channel.version)
+  var tokens []Token
+  var receiver string // address to send tokens to on this chain
+  var finalReceiver string // final intended address in forwarding case
   if transferVersion == "ics20-1" {
      FungibleTokenPacketData data = UnmarshalJSON(packet.data)
      trace, denom = parseICS20V1Denom(data.denom)
@@ -311,26 +370,44 @@ function onRecvPacket(packet: Packet) {
        amount: packet.amount
      }
      tokens = []Token{token}
+     receiver = data.receiver
   } else if transferVersion == "ics20-2" {
     FungibleTokenPacketDataV2 data = UnmarshalJSON(packet.data)
     tokens = data.tokens
+    // if we need to forward the tokens onward
+    // overwrite the receiver to temporarily send to the channel escrow address of the intended receiver
+    if len(forwardingPath.hops) > 0 {
+      // memo must be empty
+      abortTransactionUnless(memo == "")
+      if channelForwardingAddress[packet.destinationChannel] == "" {
+        channelForwardingAddress[packet.destinationChannel] = newAddress()
+      }
+      receiver = channelForwardingAddresses[packet.destinationChannel]
+      finalReceiver = data.receiver
+    } else {
+      receiver = data.receiver
+    }
   } else {
     // should never be reached as transfer version must be negotiated to be either
     // ics20-1 or ics20-2 during channel handshake
     abortTransactionUnless(false)
   }
 
+  assert(packet.sender !== "")
+  assert(receiver !== "")
+    
   // construct default acknowledgement of success
   FungibleTokenPacketAcknowledgement ack = FungibleTokenPacketAcknowledgement{true, null}
+
   prefix = "{packet.sourcePort}/{packet.sourceChannel}/"
+  receivedTokens = []Token
   for token in tokens {
     assert(token.denom !== "")
     assert(token.amount > 0)
-    assert(token.sender !== "")
-    assert(token.receiver !== "")
-      
+    
     // we are the source if the packets were prefixed by the sending chain
     source = token.trace[0] == prefix
+    var onChainTrace []string
     if source {
       // since we are receiving back to source we remove the prefix from the trace
       onChainTrace = token.trace[1:]
@@ -339,7 +416,7 @@ function onRecvPacket(packet: Packet) {
       // determine escrow account
       escrowAccount = channelEscrowAddresses[packet.destChannel]
       // unescrow tokens to receiver (assumed to fail if balance insufficient)
-      err = bank.TransferCoins(escrowAccount, data.receiver, onChainDenom, token.amount)
+      err = bank.TransferCoins(escrowAccount, receiver, onChainDenom, token.amount)
       if (err != nil) {
         ack = FungibleTokenPacketAcknowledgement{false, "transfer coins failed"}
         // break out of for loop on first error
@@ -348,17 +425,71 @@ function onRecvPacket(packet: Packet) {
     } else {
       // since we are receiving to a new sink zone we prepend the prefix to the trace
       prefix = "{packet.destPort}/{packet.destChannel}/"
-      newTrace = append([]string{prefix}, token.trace...)
-      onChainDenom = constructOnChainDenom(newTrace, token.denom)
+      onChainTrace = append([]string{prefix}, token.trace...)
+      onChainDenom = constructOnChainDenom(onChainTrace, token.denom)
       // sender was source, mint vouchers to receiver (assumed to fail if balance insufficient)
-      err = bank.MintCoins(data.receiver, onChainDenom, token.amount)
+      err = bank.MintCoins(receiver, onChainDenom, token.amount)
       if (err !== nil) {
         ack = FungibleTokenPacketAcknowledgement{false, "mint coins failed"}
         // break out of for loop on first error
         break
       }
     }
+
+    // add the received token to the received tokens list
+    recvToken = Token{
+      denom: token.denom,
+      trace: onChainTrace,
+      amount: token.amount,
+    }
+    receivedTokens = append(receivedTokens, recvToken)
   }
+
+  // if there is an error ack return immediately and do not forward further
+  if !ack.Success() {
+    return ack
+  }
+
+  // if acknowledgement is successful and forwarding path set
+  // then start forwarding
+  if len(forwardingPath.hops) > 0 {
+    //check that next channel supports token forwarding
+    channel = provableStore.get(channelPath(forwardingPath.hops[0].portID, forwardingPath.hops[0].channelID))
+    if channel.version != "ics20-2" && len(forwardingPath.hops) > 1 {
+      ack = FungibleTokenPacketAcknowledgement(false, "next hop in path cannot support forwarding onward")
+      return ack
+    }
+    memo = ""
+    nextForwardingPath = ForwardingPath{
+      hops: forwardingPath.hops[1:]
+      memo: forwardingPath.memo
+    }
+    if forwardingPath.hops == 1 {
+      // we're on the last hop, we can set memo and clear
+      // the next forwardingPath
+      memo = forwardingPath.memo
+      nextForwardingPath = nil
+    }
+    // send the tokens we received above to the next port and channel
+    // on the forwarding path
+    // and reduce the forwardingPath by the first element
+    nextPacketSequence = sendFungibleTokens(
+      receivedTokens,
+      receiver, // sender of next packet
+      finalReceiver, // receiver of next packet
+      memo,
+      nextForwardingPath,
+      forwardingPath.hops[0].portID,
+      forwardingPath.hops[0].channelID,
+      Height{},
+      currentTime() + DefaultHopTimeoutPeriod,
+    )
+    // store packet for future sending ack
+    privateStore.set(packetForwardPath(forwardingPath.hops[0].portID, forwardingPath.hops[0].channelID, nextPacketSequence), packet)
+    // use async ack until we get successful acknowledgement from further down the line.
+    return nil
+  }
+
   return ack
 }
 ```
@@ -369,9 +500,32 @@ function onRecvPacket(packet: Packet) {
 function onAcknowledgePacket(
   packet: Packet,
   acknowledgement: bytes) {
-  // if the transfer failed, refund the tokens
-  if !(acknowledgement.success) {
-    refundTokens(packet)
+  // check if the packet that was sent is from a previously forwarded packet
+  prevPacket = privateStore.get(packetForwardPath(packet.sourcePort, packet.sourceChannel))
+
+  if prevPacket != nil {
+    if acknowledgement.success {
+      FungibleTokenPacketAcknowledgement ack = FungibleTokenPacketAcknowledgement{true, "forwarded packet succeeded"}
+      handler.writeAcknowledgement(
+        prevPacket,
+        ack,
+      )
+    } else {
+      // the forwarded packet has failed, thus the funds have been refunded to the forwarding address.
+      // we must revert the changes that came from successfully receiving the tokens on our chain
+      // before propogating the error acknowledgement back to original sender chain
+      revertInFlightChanges(packet, prevPacket)
+      // write error acknowledgement
+      FungibleTokenPacketAcknowledgement ack = FungibleTokenPacketAcknowledgement{false, "forwarded packet failed"}
+      handler.writeAcknowledgement(
+        prevPacket,
+        ack,
+      )
+  } else {
+    // if the transfer failed, refund the tokens
+    if !(acknowledgement.success) {
+      refundTokens(packet)
+    }
   }
 }
 ```
@@ -380,8 +534,33 @@ function onAcknowledgePacket(
 
 ```typescript
 function onTimeoutPacket(packet: Packet) {
-  // the packet timed-out, so refund the tokens
-  refundTokens(packet)
+  // check if the packet was sent is from a previously forwarded packet
+  prevPacket = privateStore.get(packetForwardPath(packet.sourcePort, packet.sourceChannel))
+
+  if prevPacket != nil {
+    // the forwarded packet has failed, thus the funds have been refunded to the forwarding address.
+    // we must revert the changes that came from successfully receiving the tokens on our chain
+    // before propogating the error acknowledgement back to original sender chain
+    revertInFlightChanges(packet, prevPacket)
+    // write error acknowledgement
+    FungibleTokenPacketAcknowledgement ack = FungibleTokenPacketAcknowledgement{false, "forwarded packet failed"}
+    handler.writeAcknowledgement(
+      prevPacket,
+      ack,
+    )
+  } else {
+    // the packet timed-out, so refund the tokens
+    refundTokens(packet)
+  }
+}
+```
+
+##### Helper functions
+
+```typescript
+function isSource(portId: string, channelId: string, token: Token) {
+  firstTrace = "{portId}/{channelId}"
+  return token.trace[0] == firstTrace
 }
 ```
 
@@ -423,6 +602,45 @@ function refundTokens(packet: Packet) {
     } else {
       // receiver was source chain, mint vouchers back to sender
       bank.MintCoins(data.sender, onChainDenom, token.amount)
+    }
+  }
+}
+```
+
+```typescript
+// revertInFlightChanges reverts the receive packet and send packet
+// that occurs in the middle chains during a packet forwarding
+// If an error occurs further down the line, the state changes
+// on this chain must be reverted before sending back the error acknowledgement
+// to ensure atomic packet forwarding
+function revertInFlightChanges(sentPacket: Packet, receivedPacket: Packet) {
+  forwardEscrow = channelEscrowAddresses[sentPacket.sourceChannel]
+  reverseEscrow = channelEscrowAddresses[receivedPacket.destChannel]
+  // the token on our chain is the token in the sentPacket
+  for token in sentPacket.tokens {
+    // check if the packet we sent out was sending as source or not
+    // in this case we escrowed the outgoing tokens
+    if isSource(sentPacket.sourcePort, sentPacket.sourceChannel, token) {
+      // check if the packet we received was a source token for our chain
+      if isSource(receivedPacket.destinationPort, receivedPacket.desinationChannel, token) {
+        // receive sent tokens from the received escrow to the forward escrow account
+        // so we must send the tokens back from the forward escrow to the original received escrow account
+        bank.TransferCoins(forwardEscrow, reverseEscrow, token.denom, token.amount)
+      } else {
+        // receive minted vouchers and sent to the forward escrow account
+        // so we must remove the vouchers from the forward escrow account and burn them
+        bank.BurnCoins(forwardEscrow, token.denom, token.amount)
+      }
+    } else {
+      // in this case we burned the vouchers of the outgoing packets
+      // check if the packet we received was a source token for our chain
+      // in this case, the tokens were unescrowed from the reverse escrow account
+      if isSource(receivedPacket.destinationPort, receivedPacket.desinationChannel, token) {
+        // in this case we must mint the burned vouchers and send them back to the escrow account
+        bank.MintCoins(reverseEscrow, token.denom, token.amount)
+      }
+      // if it wasn't a source token on receive, then we simply had minted vouchers and burned them in the receive.
+      // So no state changes were made, and thus no reversion is necessary
     }
   }
 }
